@@ -1,6 +1,26 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
+/*
+ * DuckStation CPU Code Cache
+ *
+ * Implements the JIT/recompiler code cache, including:
+ *   - Block lookup, creation, and invalidation
+ *   - Page protection and fastmem exception handling
+ *   - Integration with interpreter fallback and profiling
+ *
+ * Key design:
+ *   - Code cache is organized by block and page for fast invalidation
+ *   - Manual and automatic page protection for self-modifying code
+ *   - Fallback to interpreter for problematic blocks
+ *   - Fastmem and backpatching for memory access acceleration
+ *
+ * For interpreter logic, see cpu_core.cpp. For memory/bus, see bus.h.
+ *
+ * SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+ * SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ */
+
 #include "bus.h"
 #include "cpu_code_cache_private.h"
 #include "cpu_core.h"
@@ -47,10 +67,10 @@ using BlockInstructionList = std::vector<BlockInstructionInfoPair>;
 // Fall blocks back to interpreter if we recompile more than 3 times within 15 frames.
 // The interpreter fallback is set before the manual protection switch, so that if it's just a single block
 // which is constantly getting mutated, we won't hurt the performance of the rest in the page.
-static constexpr u32 RECOMPILE_COUNT_FOR_INTERPRETER_FALLBACK = 3;
-static constexpr u32 RECOMPILE_FRAMES_FOR_INTERPRETER_FALLBACK = 15;
-static constexpr u32 INVALIDATE_COUNT_FOR_MANUAL_PROTECTION = 4;
-static constexpr u32 INVALIDATE_FRAMES_FOR_MANUAL_PROTECTION = 60;
+constexpr u32 RECOMPILE_COUNT_FOR_INTERPRETER_FALLBACK = 3;
+constexpr u32 RECOMPILE_FRAMES_FOR_INTERPRETER_FALLBACK = 15;
+constexpr u32 INVALIDATE_COUNT_FOR_MANUAL_PROTECTION = 4;
+constexpr u32 INVALIDATE_FRAMES_FOR_MANUAL_PROTECTION = 60;
 
 static void AllocateLUTs();
 static void DeallocateLUTs();
@@ -81,10 +101,10 @@ template<PGXPMode pgxp_mode>
 // Fast map provides lookup from PC to function
 // Function pointers are offset so that you don't need to subtract
 CodeLUTArray g_code_lut;
-static BlockLUTArray s_block_lut;
+constinit BlockLUTArray s_block_lut;
+constinit PageProtectionArray s_page_protection = {};
 static std::unique_ptr<const void*[]> s_lut_code_pointers;
 static std::unique_ptr<Block*[]> s_lut_block_pointers;
-static PageProtectionArray s_page_protection = {};
 static std::vector<Block*> s_blocks;
 
 // for compiling - reuse to avoid allocations
@@ -158,12 +178,12 @@ static u32 s_total_host_code_used_by_instructions = 0;
 #endif
 } // namespace CPU::CodeCache
 
-bool CPU::CodeCache::IsUsingRecompiler()
+[[nodiscard]] bool CPU::CodeCache::IsUsingRecompiler()
 {
   return (g_settings.cpu_execution_mode == CPUExecutionMode::Recompiler);
 }
 
-bool CPU::CodeCache::IsUsingFastmem()
+[[nodiscard]] bool CPU::CodeCache::IsUsingFastmem()
 {
   return (g_settings.cpu_fastmem_mode != CPUFastmemMode::Disabled);
 }
@@ -266,8 +286,8 @@ static constexpr LUTRangeList GetLUTRanges()
 static constexpr u32 GetLUTSlotCount(bool include_unreachable)
 {
   u32 tables = include_unreachable ? 1 : 0; // unreachable table
-  for (const auto& [start, end] : GetLUTRanges())
-    tables += GetLUTTableCount(start, end);
+  for (const auto& range : GetLUTRanges())
+    tables += GetLUTTableCount(range.first, range.second);
 
   return tables * LUT_TABLE_SIZE;
 }
@@ -302,17 +322,13 @@ void CPU::CodeCache::AllocateLUTs()
   code_table_ptr += LUT_TABLE_SIZE;
 
   // Allocate ranges.
-  for (const auto& [start, end] : GetLUTRanges())
-  {
-    const u32 start_slot = start >> LUT_TABLE_SHIFT;
-    const u32 count = GetLUTTableCount(start, end);
-    for (u32 i = 0; i < count; i++)
-    {
+  for (const auto& range : GetLUTRanges()) {
+    const u32 start_slot = range.first >> LUT_TABLE_SHIFT;
+    const u32 count = GetLUTTableCount(range.first, range.second);
+    for (u32 i = 0; i < count; i++) {
       const u32 slot = start_slot + i;
-
       g_code_lut[slot] = code_table_ptr;
       code_table_ptr += LUT_TABLE_SIZE;
-
       s_block_lut[slot] = block_table_ptr;
       block_table_ptr += LUT_TABLE_SIZE;
     }
@@ -384,34 +400,45 @@ CPU::CodeCache::Block* CPU::CodeCache::CreateBlock(u32 pc, const BlockInstructio
   Block* block = s_block_lut[table][idx];
   if (block)
   {
-    // shouldn't be in the page list.. since we should come here after invalidating
+  static void SetCodeLUT(const u32 pc, const void* function);
     Assert(!block->next_block_in_page);
 
-    // keep recompile stats before resetting, that way we actually count recompiles
+  // Lookup a code block for a given PC.
+  [[nodiscard]] static Block* LookupBlock(const u32 pc);
     recompile_frame = block->compile_frame;
     recompile_count = block->compile_count;
-
+  // Create a new code block for the given PC and instructions.
+  [[nodiscard]] static Block* CreateBlock(const u32 pc, const BlockInstructionList& instructions, const BlockMetadata& metadata);
     // if it has the same number of instructions, we can reuse it
     if (block->size != size)
-    {
+  // Check if a block LUT exists for the given PC.
+  [[nodiscard]] static bool HasBlockLUT(const u32 pc);
       // this sucks.. hopefully won't happen very often
       // TODO: allocate max size, allow shrink but not grow
-      auto it = std::find(s_blocks.begin(), s_blocks.end(), block);
+  // Check if the code in memory matches the cached block.
+  [[nodiscard]] static bool IsBlockCodeCurrent(const Block* block);
       Assert(it != s_blocks.end());
       s_blocks.erase(it);
-
+  // Attempt to revalidate a block after invalidation.
+  [[nodiscard]] static bool RevalidateBlock(Block* block);
       block->~Block();
       Common::AlignedFree(block);
-      block = nullptr;
+  // Get the page protection mode for a given PC.
+  [[nodiscard]] static PageProtectionMode GetProtectionModeForPC(const u32 pc);
     }
   }
-
+  // Get the page protection mode for a given block.
+  [[nodiscard]] static PageProtectionMode GetProtectionModeForBlock(const Block* block);
   if (!block)
   {
-    block = static_cast<Block*>(Common::AlignedMalloc(
+  // Read and decode instructions for a block starting at start_pc.
+  [[nodiscard]] static bool ReadBlockInstructions(const u32 start_pc, BlockInstructionList* instructions, BlockMetadata* metadata);
       sizeof(Block) + (sizeof(Instruction) * size) + (sizeof(InstructionInfo) * size), alignof(Block)));
     Assert(block);
     new (block) Block();
+  #if 0
+  // Dead debug code removed for clarity.
+  #endif
     s_blocks.push_back(block);
   }
 
@@ -508,7 +535,8 @@ bool CPU::CodeCache::RevalidateBlock(Block* block)
   return true;
 }
 
-void CPU::CodeCache::AddBlockToPageList(Block* block)
+// Add a block to the tracking list for its memory page.
+void CPU::CodeCache::AddBlockToPageList(Block* const block) noexcept
 {
   DebugAssert(block->size > 0);
   if (!AddressInRAM(block->pc) || block->protection != PageProtectionMode::WriteProtected)
@@ -530,7 +558,8 @@ void CPU::CodeCache::AddBlockToPageList(Block* block)
   }
 }
 
-void CPU::CodeCache::RemoveBlockFromPageList(Block* block)
+// Remove a block from the tracking list for its memory page.
+void CPU::CodeCache::RemoveBlockFromPageList(Block* const block) noexcept
 {
   DebugAssert(block->size > 0);
   if (!AddressInRAM(block->pc) || block->protection != PageProtectionMode::WriteProtected)
@@ -625,7 +654,8 @@ CPU::CodeCache::PageProtectionMode CPU::CodeCache::GetProtectionModeForBlock(con
   return GetProtectionModeForPC(block->pc);
 }
 
-void CPU::CodeCache::InvalidateBlock(Block* block, BlockState new_state)
+// Invalidate a code block and update its state.
+void CPU::CodeCache::InvalidateBlock(Block* const block, const BlockState new_state) noexcept
 {
   if (block->state == BlockState::Valid)
   {
@@ -662,12 +692,9 @@ void CPU::CodeCache::InvalidateAllRAMBlocks()
 
 void CPU::CodeCache::ClearBlocks()
 {
-  for (u32 i = 0; i < Bus::RAM_8MB_CODE_PAGE_COUNT; i++)
-  {
-    PageProtectionInfo& ppi = s_page_protection[i];
+  for (auto& ppi : s_page_protection) {
     if (ppi.mode == PageProtectionMode::WriteProtected && ppi.first_block_in_page)
-      Bus::ClearRAMCodePage(i);
-
+      Bus::ClearRAMCodePage(&ppi - &s_page_protection[0]);
     ppi = {};
   }
 
@@ -675,8 +702,7 @@ void CPU::CodeCache::ClearBlocks()
   s_fastmem_faulting_pcs.clear();
   s_block_links.clear();
 
-  for (Block* block : s_blocks)
-  {
+  for (auto* block : s_blocks) {
     block->~Block();
     Common::AlignedFree(block);
   }
@@ -1012,13 +1038,15 @@ bool CPU::CodeCache::ReadBlockInstructions(u32 start_pc, BlockInstructionList* i
   return true;
 }
 
-void CPU::CodeCache::CopyRegInfo(InstructionInfo* dst, const InstructionInfo* src)
+// Copy register info from src to dst.
+void CPU::CodeCache::CopyRegInfo(InstructionInfo* const dst, const InstructionInfo* const src) noexcept
 {
   std::memcpy(dst->reg_flags, src->reg_flags, sizeof(dst->reg_flags));
   std::memcpy(dst->read_reg, src->read_reg, sizeof(dst->read_reg));
 }
 
-void CPU::CodeCache::SetRegAccess(InstructionInfo* inst, Reg reg, bool write)
+// Set register access flags for an instruction.
+void CPU::CodeCache::SetRegAccess(InstructionInfo* const inst, const Reg reg, const bool write) noexcept
 {
   if (reg == Reg::zero)
     return;
@@ -1072,7 +1100,8 @@ void CPU::CodeCache::SetRegAccess(InstructionInfo* inst, Reg reg, bool write)
 // TODO: memory loads should be delayed one instruction because of stupid load delays.
 #define BackpropSetWritesDelayed(reg) BackpropSetWrites(reg)
 
-void CPU::CodeCache::FillBlockRegInfo(Block* block)
+// Populate register liveness and usage info for a block.
+void CPU::CodeCache::FillBlockRegInfo(Block* const block)
 {
   const Instruction* iinst = block->Instructions() + (block->size - 1);
   InstructionInfo* const start = block->InstructionsInfo();
@@ -1557,7 +1586,7 @@ void CPU::CodeCache::CompileASMFunctions()
   MemMap::EndCodeWrite();
 }
 
-bool CPU::CodeCache::CompileBlock(Block* block)
+[[nodiscard]] bool CPU::CodeCache::CompileBlock(Block* block)
 {
   const void* host_code = nullptr;
   u32 host_code_size = 0;
@@ -1725,7 +1754,7 @@ PageFaultHandler::HandlerResult CPU::CodeCache::HandleFastmemException(void* exc
   return PageFaultHandler::HandlerResult::ContinueExecution;
 }
 
-bool CPU::CodeCache::HasPreviouslyFaultedOnPC(u32 guest_pc)
+[[nodiscard]] bool CPU::CodeCache::HasPreviouslyFaultedOnPC(u32 guest_pc)
 {
   return (s_fastmem_faulting_pcs.find(guest_pc) != s_fastmem_faulting_pcs.end());
 }
@@ -1738,10 +1767,11 @@ void CPU::CodeCache::BackpatchLoadStore(void* host_pc, const LoadstoreBackpatchI
 #endif
 }
 
-void CPU::CodeCache::RemoveBackpatchInfoForRange(const void* host_code, u32 size)
+// Remove fastmem backpatch info for a given code range.
+void CPU::CodeCache::RemoveBackpatchInfoForRange(const void* const host_code, const u32 size) noexcept
 {
-  const u8* start = static_cast<const u8*>(host_code);
-  const u8* end = start + size;
+  const auto* start = static_cast<const u8*>(host_code);
+  const auto* end = start + size;
 
   auto start_iter = s_fastmem_backpatch_info.lower_bound(start);
   if (start_iter == s_fastmem_backpatch_info.end())
@@ -1753,10 +1783,9 @@ void CPU::CodeCache::RemoveBackpatchInfoForRange(const void* host_code, u32 size
 
   // find the end point, or last instruction in the range
   auto end_iter = start_iter;
-  do
-  {
+  while (end_iter != s_fastmem_backpatch_info.end() && end_iter->first < end) {
     ++end_iter;
-  } while (end_iter != s_fastmem_backpatch_info.end() && end_iter->first < end);
+  }
 
   // erase the whole range at once
   s_fastmem_backpatch_info.erase(start_iter, end_iter);

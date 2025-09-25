@@ -1,6 +1,29 @@
 // SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
+/*
+ * DuckStation CPU Core
+ *
+ * Implements the main PlayStation CPU emulation logic, including:
+ *   - CPU state management and register emulation
+ *   - Exception and interrupt handling
+ *   - Breakpoint and debugging support
+ *   - Interpreter execution and pipeline emulation
+ *
+ * Key design:
+ *   - State is stored in the global g_state struct (see cpu_core.h)
+ *   - Exception/interrupt logic closely follows MIPS architecture
+ *   - Breakpoints and tracing are integrated for debugging and dev tools
+ *   - JIT/recompiler logic is separated (see cpu_code_cache.cpp)
+ *
+ * For JIT/recompiler, see cpu_code_cache.cpp. For memory/bus, see bus.h.
+ *
+ * SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+ * SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ */
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
 #include "cpu_core.h"
 #include "bus.h"
 #include "cpu_code_cache_private.h"
@@ -30,7 +53,9 @@
 LOG_CHANNEL(CPU);
 
 namespace CPU {
-enum class ExecutionBreakType
+
+/// \brief Types of execution break events for the CPU debugger.
+enum class [[nodiscard]] ExecutionBreakType
 {
   None,
   ExecuteOneInstruction,
@@ -107,7 +132,8 @@ static std::FILE* s_log_file = nullptr;
 static bool s_log_file_opened = false;
 static bool s_trace_to_log = false;
 
-static constexpr u32 INVALID_BREAKPOINT_PC = UINT32_C(0xFFFFFFFF);
+/// \brief Invalid PC value for breakpoints.
+constinit static constexpr u32 INVALID_BREAKPOINT_PC = UINT32_C(0xFFFFFFFF);
 static std::array<std::vector<Breakpoint>, static_cast<u32>(BreakpointType::Count)> s_breakpoints;
 static u32 s_breakpoint_counter = 1;
 static u32 s_last_breakpoint_check_pc = INVALID_BREAKPOINT_PC;
@@ -115,89 +141,84 @@ static CPUExecutionMode s_current_execution_mode = CPUExecutionMode::Interpreter
 static ExecutionBreakType s_break_type = ExecutionBreakType::None;
 } // namespace CPU
 
-bool CPU::IsTraceEnabled()
+/// Returns true if trace logging is enabled.
+[[nodiscard]] bool CPU::IsTraceEnabled() noexcept
 {
   return s_trace_to_log;
 }
 
-void CPU::StartTrace()
+/// Enable trace logging for CPU execution.
+void CPU::StartTrace() noexcept
 {
   if (s_trace_to_log)
     return;
-
   s_trace_to_log = true;
   if (UpdateDebugDispatcherFlag())
     System::InterruptExecution();
 }
 
-void CPU::StopTrace()
+/// Disable trace logging for CPU execution.
+void CPU::StopTrace() noexcept
 {
   if (!s_trace_to_log)
     return;
-
   if (s_log_file)
     std::fclose(s_log_file);
-
   s_log_file_opened = false;
   s_trace_to_log = false;
   if (UpdateDebugDispatcherFlag())
     System::InterruptExecution();
 }
 
-void CPU::WriteToExecutionLog(const char* format, ...)
+/// Write a formatted message to the execution log file.
+void CPU::WriteToExecutionLog(const char* format, ...) noexcept
 {
-  if (!s_log_file_opened) [[unlikely]]
-  {
+  if (!s_log_file_opened) [[unlikely]] {
     s_log_file = FileSystem::OpenCFile(Path::Combine(EmuFolders::DataRoot, "cpu_log.txt").c_str(), "wb");
     s_log_file_opened = true;
   }
-
-  if (s_log_file)
-  {
+  if (s_log_file) {
     std::va_list ap;
     va_start(ap, format);
     std::vfprintf(s_log_file, format, ap);
     va_end(ap);
-
 #ifdef _DEBUG
     std::fflush(s_log_file);
 #endif
   }
 }
 
-void CPU::Initialize()
+/// Initialize CPU state and breakpoints.
+void CPU::Initialize() noexcept
 {
   // From nocash spec.
   g_state.cop0_regs.PRID = UINT32_C(0x00000002);
-
   s_current_execution_mode = g_settings.cpu_execution_mode;
   g_state.using_debug_dispatcher = false;
   g_state.using_interpreter = (s_current_execution_mode == CPUExecutionMode::Interpreter);
-  for (BreakpointList& bps : s_breakpoints)
+  for (auto& bps : s_breakpoints)
     bps.clear();
   s_breakpoint_counter = 1;
   s_last_breakpoint_check_pc = INVALID_BREAKPOINT_PC;
   s_break_type = ExecutionBreakType::None;
-
   UpdateMemoryPointers();
   UpdateDebugDispatcherFlag();
-
   GTE::Initialize();
 }
 
-void CPU::Shutdown()
+/// Shutdown CPU and cleanup breakpoints and trace log.
+void CPU::Shutdown() noexcept
 {
   ClearBreakpoints();
   StopTrace();
 }
 
-void CPU::Reset()
+/// Reset CPU state and registers.
+void CPU::Reset() noexcept
 {
   g_state.exception_raised = false;
   g_state.bus_error = false;
-
   g_state.regs = {};
-
   g_state.cop0_regs.BPC = 0;
   g_state.cop0_regs.BDA = 0;
   g_state.cop0_regs.TAR = 0;
@@ -208,19 +229,14 @@ void CPU::Reset()
   g_state.cop0_regs.dcic.bits = 0;
   g_state.cop0_regs.sr.bits = 0;
   g_state.cop0_regs.cause.bits = 0;
-
   ClearICache();
   UpdateMemoryPointers();
   UpdateDebugDispatcherFlag();
-
   GTE::Reset();
-
   if (g_settings.gpu_pgxp_enable)
     PGXP::Reset();
-
   // This consumes cycles, so do it first.
   SetPC(RESET_VECTOR);
-
   g_state.downcount = 0;
   g_state.pending_ticks = 0;
   g_state.gte_completion_tick = 0;
@@ -311,14 +327,17 @@ bool CPU::DoState(StateWrapper& sw)
   return !sw.HasError();
 }
 
-void CPU::SetPC(u32 new_pc)
+// Set the program counter and flush the pipeline.
+/// Set the program counter and flush the pipeline.
+void CPU::SetPC(const u32 new_pc) noexcept
 {
   DebugAssert(Common::IsAlignedPow2(new_pc, 4));
   g_state.npc = new_pc;
   FlushPipeline();
 }
 
-ALWAYS_INLINE_RELEASE void CPU::Branch(u32 target)
+/// Perform a branch to the given target address, handling misalignment exceptions.
+ALWAYS_INLINE_RELEASE void CPU::Branch(const u32 target) noexcept
 {
   if (!Common::IsAlignedPow2(target, 4))
   {
@@ -327,7 +346,6 @@ ALWAYS_INLINE_RELEASE void CPU::Branch(u32 target)
     RaiseException(Cop0Registers::CAUSE::MakeValueForException(Exception::AdEL, false, false, 0), target);
     return;
   }
-
   g_state.npc = target;
   g_state.branch_was_taken = true;
 }
@@ -338,7 +356,8 @@ ALWAYS_INLINE_RELEASE u32 CPU::GetExceptionVector(bool debug_exception /* = fals
   return base | (debug_exception ? UINT32_C(0x00000040) : UINT32_C(0x00000080));
 }
 
-ALWAYS_INLINE_RELEASE void CPU::RaiseException(u32 CAUSE_bits, u32 EPC, u32 vector)
+/// Raise a CPU exception, updating state and pipeline as needed.
+ALWAYS_INLINE_RELEASE void CPU::RaiseException(const u32 CAUSE_bits, const u32 EPC, const u32 vector) noexcept
 {
   g_state.cop0_regs.EPC = EPC;
   g_state.cop0_regs.cause.bits = (g_state.cop0_regs.cause.bits & ~Cop0Registers::CAUSE::EXCEPTION_WRITE_MASK) |
@@ -392,12 +411,12 @@ ALWAYS_INLINE_RELEASE void CPU::DispatchCop0Breakpoint()
                  g_state.current_instruction_pc, GetExceptionVector(true));
 }
 
-void CPU::RaiseException(u32 CAUSE_bits, u32 EPC)
+void CPU::RaiseException(const u32 CAUSE_bits, const u32 EPC) noexcept
 {
   RaiseException(CAUSE_bits, EPC, GetExceptionVector());
 }
 
-void CPU::RaiseException(Exception excode)
+void CPU::RaiseException(const Exception excode) noexcept
 {
   RaiseException(Cop0Registers::CAUSE::MakeValueForException(excode, g_state.current_instruction_in_branch_delay_slot,
                                                              g_state.current_instruction_was_branch_taken,
@@ -506,7 +525,9 @@ ALWAYS_INLINE_RELEASE void CPU::WriteRegDelayed(Reg rd, u32 value)
 
 ALWAYS_INLINE_RELEASE bool CPU::IsCop0ExecutionBreakpointUnmasked()
 {
-  static constexpr const u32 code_address_ranges[][2] = {
+
+  /// \brief Address ranges for code breakpoints (RAM and BIOS, all segments).
+  constinit static constexpr std::array<std::array<u32, 2>, 8> code_address_ranges = {{
     // KUSEG
     {Bus::RAM_BASE, Bus::RAM_BASE | Bus::RAM_8MB_MASK},
     {Bus::BIOS_BASE, Bus::BIOS_BASE | Bus::BIOS_MASK},
@@ -518,7 +539,7 @@ ALWAYS_INLINE_RELEASE bool CPU::IsCop0ExecutionBreakpointUnmasked()
     // KSEG1
     {0xA0000000u | Bus::RAM_BASE, 0xA0000000u | Bus::RAM_BASE | Bus::RAM_8MB_MASK},
     {0xA0000000u | Bus::BIOS_BASE, 0xA0000000u | Bus::BIOS_BASE | Bus::BIOS_MASK},
-  };
+  }};
 
   const u32 bpc = g_state.cop0_regs.BPC;
   const u32 bpcm = g_state.cop0_regs.BPCM;
@@ -607,37 +628,39 @@ void CPU::TracePrintInstruction()
 
 #endif
 
-void CPU::PrintInstruction(u32 bits, u32 pc, bool regs, const char* prefix)
+/// Print a disassembled instruction with optional register info.
+void CPU::PrintInstruction(const u32 bits, const u32 pc, const bool regs, const char* const prefix) noexcept
 {
   TinyString instr;
   DisassembleInstruction(&instr, pc, bits);
   if (regs)
   {
-    TinyString comment;
+  static void Branch(const u32 target);
     DisassembleInstructionComment(&comment, pc, bits);
     if (!comment.empty())
-    {
+  static u32 GetExceptionVector(const bool debug_exception = false);
       for (u32 i = instr.length(); i < 30; i++)
         instr.append(' ');
-      instr.append("; ");
+  static void RaiseException(const u32 CAUSE_bits, const u32 EPC, const u32 vector);
       instr.append(comment);
     }
-  }
+  static u32 ReadReg(const Reg rs);
 
   DEV_LOG("{}{:08x}: {:08x} {}", prefix, pc, bits, instr);
-}
+  static void WriteReg(const Reg rd, const u32 value);
 
-void CPU::LogInstruction(u32 bits, u32 pc, bool regs)
-{
+/// Log a disassembled instruction with optional register info to the execution log.
+void CPU::LogInstruction(const u32 bits, const u32 pc, const bool regs) noexcept
+  static void WriteRegDelayed(const Reg rd, const u32 value);
   TinyString instr;
   DisassembleInstruction(&instr, pc, bits);
-  if (regs)
+  static void DisassembleAndPrint(const u32 addr, const bool regs, const char* prefix);
   {
     TinyString comment;
-    DisassembleInstructionComment(&comment, pc, bits);
+  static void PrintInstruction(const u32 bits, const u32 pc, const bool regs, const char* prefix);
     if (!comment.empty())
     {
-      for (u32 i = instr.length(); i < 30; i++)
+  static void LogInstruction(const u32 bits, const u32 pc, const bool regs);
         instr.append(' ');
       instr.append("; ");
       instr.append(comment);
@@ -647,42 +670,46 @@ void CPU::LogInstruction(u32 bits, u32 pc, bool regs)
   WriteToExecutionLog("%08x: %08x %s\n", pc, bits, instr.c_str());
 }
 
-void CPU::HandleWriteSyscall()
+
+/// \brief Handles the MIPS write syscall for outputting to stdout.
+///        Only supports file descriptor 1 (stdout).
+void CPU::HandleWriteSyscall() noexcept
 {
   const auto& regs = g_state.regs;
-  if (regs.a0 != 1) // stdout
+  if (regs.a0 != 1) // Only handle stdout
     return;
 
   u32 addr = regs.a1;
   const u32 count = regs.a2;
-  for (u32 i = 0; i < count; i++)
+  for (u32 i = 0; i < count; ++i)
   {
-    u8 value;
+    u8 value = 0;
     if (!SafeReadMemoryByte(addr++, &value) || value == 0)
       break;
-
     Bus::AddTTYCharacter(static_cast<char>(value));
   }
 }
 
-void CPU::HandlePutcSyscall()
+
+/// \brief Handles the MIPS putc syscall for outputting a single character.
+void CPU::HandlePutcSyscall() noexcept
 {
   const auto& regs = g_state.regs;
   if (regs.a0 != 0)
     Bus::AddTTYCharacter(static_cast<char>(regs.a0));
 }
 
-void CPU::HandlePutsSyscall()
+
+/// \brief Handles the MIPS puts syscall for outputting a null-terminated string.
+void CPU::HandlePutsSyscall() noexcept
 {
   const auto& regs = g_state.regs;
-
   u32 addr = regs.a0;
-  for (u32 i = 0; i < 1024; i++)
+  for (u32 i = 0; i < 1024; ++i)
   {
-    u8 value;
+    u8 value = 0;
     if (!SafeReadMemoryByte(addr++, &value) || value == 0)
       break;
-
     Bus::AddTTYCharacter(static_cast<char>(value));
   }
 }
@@ -711,7 +738,9 @@ void CPU::HandleB0Syscall()
     HandlePutsSyscall();
 }
 
-const std::array<CPU::DebuggerRegisterListEntry, CPU::NUM_DEBUGGER_REGISTER_LIST_ENTRIES>
+
+/// \brief List of debugger register entries for the CPU, used for introspection and debugging tools.
+constinit const std::array<CPU::DebuggerRegisterListEntry, CPU::NUM_DEBUGGER_REGISTER_LIST_ENTRIES>
   CPU::g_debugger_register_list = {{{"zero", &CPU::g_state.regs.zero},
                                     {"at", &CPU::g_state.regs.at},
                                     {"v0", &CPU::g_state.regs.v0},
@@ -818,7 +847,13 @@ const std::array<CPU::DebuggerRegisterListEntry, CPU::NUM_DEBUGGER_REGISTER_LIST
                                     {"ZSF4", &CPU::g_state.gte_regs.r32[62]},
                                     {"FLAG", &CPU::g_state.gte_regs.r32[63]}}};
 
-ALWAYS_INLINE static constexpr bool AddOverflow(u32 old_value, u32 add_value, u32* new_value)
+
+/// \brief Performs a signed 32-bit addition with overflow detection.
+/// \param old_value The original value.
+/// \param add_value The value to add.
+/// \param new_value Pointer to store the result.
+/// \return True if overflow occurred, false otherwise.
+[[nodiscard]] ALWAYS_INLINE static constexpr bool AddOverflow(const u32 old_value, const u32 add_value, u32* const new_value) noexcept
 {
 #if defined(__clang__) || defined(__GNUC__)
   return __builtin_add_overflow(static_cast<s32>(old_value), static_cast<s32>(add_value),
@@ -829,7 +864,13 @@ ALWAYS_INLINE static constexpr bool AddOverflow(u32 old_value, u32 add_value, u3
 #endif
 }
 
-ALWAYS_INLINE static constexpr bool SubOverflow(u32 old_value, u32 sub_value, u32* new_value)
+
+/// \brief Performs a signed 32-bit subtraction with overflow detection.
+/// \param old_value The original value.
+/// \param sub_value The value to subtract.
+/// \param new_value Pointer to store the result.
+/// \return True if overflow occurred, false otherwise.
+[[nodiscard]] ALWAYS_INLINE static constexpr bool SubOverflow(const u32 old_value, const u32 sub_value, u32* const new_value) noexcept
 {
 #if defined(__clang__) || defined(__GNUC__)
   return __builtin_sub_overflow(static_cast<s32>(old_value), static_cast<s32>(sub_value),
@@ -840,24 +881,34 @@ ALWAYS_INLINE static constexpr bool SubOverflow(u32 old_value, u32 sub_value, u3
 #endif
 }
 
-void CPU::DisassembleAndPrint(u32 addr, bool regs, const char* prefix)
+
+/// \brief Disassembles and prints a single instruction at the given address.
+/// \param addr Address of the instruction to disassemble.
+/// \param regs Whether to print register values.
+/// \param prefix Optional prefix for the output line.
+void CPU::DisassembleAndPrint(const u32 addr, const bool regs, const char* const prefix) noexcept
 {
   u32 bits = 0;
   SafeReadMemoryWord(addr, &bits);
   PrintInstruction(bits, addr, regs, prefix);
 }
 
-void CPU::DisassembleAndPrint(u32 addr, u32 instructions_before /* = 0 */, u32 instructions_after /* = 0 */)
+
+/// \brief Disassembles and prints a range of instructions around a given address.
+/// \param addr Address of the central instruction.
+/// \param instructions_before Number of instructions to print before the central instruction.
+/// \param instructions_after Number of instructions to print after the central instruction.
+void CPU::DisassembleAndPrint(const u32 addr, const u32 instructions_before /* = 0 */, const u32 instructions_after /* = 0 */) noexcept
 {
   u32 disasm_addr = addr - (instructions_before * sizeof(u32));
-  for (u32 i = 0; i < instructions_before; i++)
+  for (u32 i = 0; i < instructions_before; ++i)
   {
     DisassembleAndPrint(disasm_addr, false, "");
     disasm_addr += sizeof(u32);
   }
 
   // <= to include the instruction itself
-  for (u32 i = 0; i <= instructions_after; i++)
+  for (u32 i = 0; i <= instructions_after; ++i)
   {
     DisassembleAndPrint(disasm_addr, (i == 0), (i == 0) ? "---->" : "");
     disasm_addr += sizeof(u32);
@@ -1275,30 +1326,39 @@ restart_instruction:
 
         default:
         {
-          RaiseException(Exception::RI);
+        // Perform a branch to the given target address, handling misalignment exceptions.
+        ALWAYS_INLINE_RELEASE void CPU::Branch(const u32 target)
           break;
         }
-      }
+        // Get the exception vector address for the current mode.
+        ALWAYS_INLINE_RELEASE u32 CPU::GetExceptionVector(const bool debug_exception /* = false*/)
     }
     break;
-
+        // Raise a CPU exception, updating state and pipeline as needed.
+        ALWAYS_INLINE_RELEASE void CPU::RaiseException(const u32 CAUSE_bits, const u32 EPC, const u32 vector)
     case InstructionOp::lui:
     {
-      const u32 value = inst.i.imm_zext32() << 16;
+        // Read a CPU register value.
+        ALWAYS_INLINE u32 CPU::ReadReg(const Reg rs)
       WriteReg(inst.i.rt, value);
 
-      if constexpr (pgxp_mode >= PGXPMode::CPU)
+        // Write a value to a CPU register, handling $zero and load delay.
+        ALWAYS_INLINE void CPU::WriteReg(const Reg rd, const u32 value)
         PGXP::CPU_LUI(inst);
     }
-    break;
+        // Write a value to a CPU register with load delay semantics.
+        ALWAYS_INLINE_RELEASE void CPU::WriteRegDelayed(const Reg rd, const u32 value)
 
     case InstructionOp::andi:
-    {
+        void CPU::PrintInstruction(const u32 bits, const u32 pc, const bool regs, const char* prefix)
       const u32 rsVal = ReadReg(inst.i.rs);
       const u32 new_value = rsVal & inst.i.imm_zext32();
-      WriteReg(inst.i.rt, new_value);
+        void CPU::LogInstruction(const u32 bits, const u32 pc, const bool regs)
 
       if constexpr (pgxp_mode >= PGXPMode::CPU)
+        #if 0
+        // Dead debug code removed for clarity.
+        #endif
         PGXP::CPU_ANDI(inst, rsVal);
     }
     break;
@@ -2160,7 +2220,8 @@ ALWAYS_INLINE CPU::BreakpointList& CPU::GetBreakpointList(BreakpointType type)
 
 const char* CPU::GetBreakpointTypeName(BreakpointType type)
 {
-  static constexpr std::array<const char*, static_cast<u32>(BreakpointType::Count)> names = {{
+  /// \brief Names for each BreakpointType.
+  constinit static constexpr std::array<const char*, static_cast<u32>(BreakpointType::Count)> names = {{
     "Execute",
     "Read",
     "Write",
@@ -2883,7 +2944,10 @@ ALWAYS_INLINE_RELEASE static u32 ReadICache(VirtualMemoryAddress address)
 }
 } // namespace CPU
 
-ALWAYS_INLINE_RELEASE bool CPU::FetchInstruction()
+
+/// \brief Fetches the next instruction for execution, updating the PC and NPC.
+/// \return True if the instruction was fetched successfully, false if an exception occurred.
+[[nodiscard]] ALWAYS_INLINE_RELEASE bool CPU::FetchInstruction() noexcept
 {
   DebugAssert(Common::IsAlignedPow2(g_state.npc, 4));
 
@@ -2928,7 +2992,10 @@ ALWAYS_INLINE_RELEASE bool CPU::FetchInstruction()
   return true;
 }
 
-bool CPU::FetchInstructionForInterpreterFallback()
+
+/// \brief Fetches the next instruction for interpreter fallback, updating PC and NPC.
+/// \return True if the instruction was fetched successfully, false if an exception occurred.
+[[nodiscard]] bool CPU::FetchInstructionForInterpreterFallback() noexcept
 {
   if (!Common::IsAlignedPow2(g_state.npc, 4)) [[unlikely]]
   {
@@ -2971,7 +3038,12 @@ bool CPU::FetchInstructionForInterpreterFallback()
   return true;
 }
 
-bool CPU::SafeReadInstruction(VirtualMemoryAddress addr, u32* value)
+
+/// \brief Safely reads an instruction word from memory, handling address regions.
+/// \param addr The virtual memory address to read from.
+/// \param value Pointer to store the read instruction word.
+/// \return True if the read was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeReadInstruction(const VirtualMemoryAddress addr, u32* const value) noexcept
 {
   switch (addr >> 29)
   {
@@ -2995,10 +3067,18 @@ bool CPU::SafeReadInstruction(VirtualMemoryAddress addr, u32* value)
   }
 }
 
+
+/// \brief Safely performs a memory access (read or write) for the given address and size.
+/// 	param type The memory access type (read or write).
+/// 	param size The memory access size (byte, halfword, word).
+/// \param address The virtual memory address to access.
+/// \param value Reference to the value to read or write.
+/// \return True if the access was successful, false otherwise.
 template<MemoryAccessType type, MemoryAccessSize size>
-ALWAYS_INLINE bool CPU::DoSafeMemoryAccess(VirtualMemoryAddress address, u32& value)
+[[nodiscard]] ALWAYS_INLINE bool CPU::DoSafeMemoryAccess(const VirtualMemoryAddress address_in, u32& value) noexcept
 {
   using namespace Bus;
+  VirtualMemoryAddress address = address_in;
 
   switch (address >> 29)
   {
@@ -3162,7 +3242,12 @@ bool CPU::SafeReadMemoryByte(VirtualMemoryAddress addr, u8* value)
   return true;
 }
 
-bool CPU::SafeReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
+
+/// \brief Safely reads a halfword (16 bits) from memory, handling alignment and access.
+/// \param addr The virtual memory address to read from.
+/// \param value Pointer to store the read halfword.
+/// \return True if the read was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeReadMemoryHalfWord(const VirtualMemoryAddress addr, u16* const value) noexcept
 {
   if ((addr & 1) == 0)
   {
@@ -3174,7 +3259,7 @@ bool CPU::SafeReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
     return true;
   }
 
-  u8 low, high;
+  u8 low = 0, high = 0;
   if (!SafeReadMemoryByte(addr, &low) || !SafeReadMemoryByte(addr + 1, &high))
     return false;
 
@@ -3182,12 +3267,17 @@ bool CPU::SafeReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
   return true;
 }
 
-bool CPU::SafeReadMemoryWord(VirtualMemoryAddress addr, u32* value)
+
+/// \brief Safely reads a word (32 bits) from memory, handling alignment and access.
+/// \param addr The virtual memory address to read from.
+/// \param value Pointer to store the read word.
+/// \return True if the read was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeReadMemoryWord(const VirtualMemoryAddress addr, u32* const value) noexcept
 {
   if ((addr & 3) == 0)
     return DoSafeMemoryAccess<MemoryAccessType::Read, MemoryAccessSize::Word>(addr, *value);
 
-  u16 low, high;
+  u16 low = 0, high = 0;
   if (!SafeReadMemoryHalfWord(addr, &low) || !SafeReadMemoryHalfWord(addr + 2, &high))
     return false;
 
@@ -3195,34 +3285,50 @@ bool CPU::SafeReadMemoryWord(VirtualMemoryAddress addr, u32* value)
   return true;
 }
 
-bool CPU::SafeReadMemoryCString(VirtualMemoryAddress addr, std::string* value, u32 max_length /*= 1024*/)
+
+/// \brief Safely reads a null-terminated C string from memory.
+/// \param addr The virtual memory address to start reading from.
+/// \param value Pointer to store the resulting string.
+/// \param max_length Maximum number of characters to read (default: 1024).
+/// \return True if the string was read successfully, false otherwise.
+[[nodiscard]] bool CPU::SafeReadMemoryCString(VirtualMemoryAddress addr, std::string* const value, const u32 max_length /*= 1024*/) noexcept
 {
   value->clear();
 
-  u8 ch;
+  u8 ch = 0;
   while (SafeReadMemoryByte(addr, &ch))
   {
     if (ch == 0)
       return true;
 
-    value->push_back(ch);
+    value->push_back(static_cast<char>(ch));
     if (value->size() >= max_length)
       return true;
 
-    addr++;
+    ++addr;
   }
 
   value->clear();
   return false;
 }
 
-bool CPU::SafeWriteMemoryByte(VirtualMemoryAddress addr, u8 value)
+
+/// \brief Safely writes a byte to memory.
+/// \param addr The virtual memory address to write to.
+/// \param value The byte value to write.
+/// \return True if the write was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeWriteMemoryByte(const VirtualMemoryAddress addr, const u8 value) noexcept
 {
   u32 temp = ZeroExtend32(value);
   return DoSafeMemoryAccess<MemoryAccessType::Write, MemoryAccessSize::Byte>(addr, temp);
 }
 
-bool CPU::SafeWriteMemoryHalfWord(VirtualMemoryAddress addr, u16 value)
+
+/// \brief Safely writes a halfword (16 bits) to memory, handling alignment and access.
+/// \param addr The virtual memory address to write to.
+/// \param value The halfword value to write.
+/// \return True if the write was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeWriteMemoryHalfWord(const VirtualMemoryAddress addr, const u16 value) noexcept
 {
   if ((addr & 1) == 0)
   {
@@ -3233,7 +3339,12 @@ bool CPU::SafeWriteMemoryHalfWord(VirtualMemoryAddress addr, u16 value)
   return SafeWriteMemoryByte(addr, Truncate8(value)) && SafeWriteMemoryByte(addr + 1, Truncate8(value >> 8));
 }
 
-bool CPU::SafeWriteMemoryWord(VirtualMemoryAddress addr, u32 value)
+
+/// \brief Safely writes a word (32 bits) to memory, handling alignment and access.
+/// \param addr The virtual memory address to write to.
+/// \param value The word value to write.
+/// \return True if the write was successful, false otherwise.
+[[nodiscard]] bool CPU::SafeWriteMemoryWord(const VirtualMemoryAddress addr, const u32 value) noexcept
 {
   if ((addr & 3) == 0)
     return DoSafeMemoryAccess<MemoryAccessType::Write, MemoryAccessSize::Word>(addr, value);
@@ -3241,22 +3352,28 @@ bool CPU::SafeWriteMemoryWord(VirtualMemoryAddress addr, u32 value)
   return SafeWriteMemoryHalfWord(addr, Truncate16(value)) && SafeWriteMemoryHalfWord(addr + 2, Truncate16(value >> 16));
 }
 
-bool CPU::SafeReadMemoryBytes(VirtualMemoryAddress addr, void* data, u32 length)
+
+/// \brief Safely reads a sequence of bytes from memory.
+/// \param addr The virtual memory address to start reading from.
+/// \param data Pointer to the buffer to store the read bytes.
+/// \param length Number of bytes to read.
+/// \return True if all bytes were read successfully, false otherwise.
+[[nodiscard]] bool CPU::SafeReadMemoryBytes(const VirtualMemoryAddress addr_in, void* const data, const u32 length) noexcept
 {
   using namespace Bus;
+  VirtualMemoryAddress addr = addr_in;
 
   const u32 seg = (addr >> 29);
   if ((seg != 0 && seg != 4 && seg != 5) || (((addr + length) & KSEG_MASK) >= RAM_MIRROR_END) ||
       (((addr & g_ram_mask) + length) > g_ram_size))
   {
-    u8* ptr = static_cast<u8*>(data);
-    u8* const ptr_end = ptr + length;
+    auto* ptr = static_cast<u8*>(data);
+    auto* const ptr_end = ptr + length;
     while (ptr != ptr_end)
     {
       if (!SafeReadMemoryByte(addr++, ptr++))
         return false;
     }
-
     return true;
   }
 
@@ -3265,22 +3382,28 @@ bool CPU::SafeReadMemoryBytes(VirtualMemoryAddress addr, void* data, u32 length)
   return true;
 }
 
-bool CPU::SafeWriteMemoryBytes(VirtualMemoryAddress addr, const void* data, u32 length)
+
+/// \brief Safely writes a sequence of bytes to memory.
+/// \param addr The virtual memory address to start writing to.
+/// \param data Pointer to the buffer containing bytes to write.
+/// \param length Number of bytes to write.
+/// \return True if all bytes were written successfully, false otherwise.
+[[nodiscard]] bool CPU::SafeWriteMemoryBytes(const VirtualMemoryAddress addr_in, const void* const data, const u32 length) noexcept
 {
   using namespace Bus;
+  VirtualMemoryAddress addr = addr_in;
 
   const u32 seg = (addr >> 29);
   if ((seg != 0 && seg != 4 && seg != 5) || (((addr + length) & KSEG_MASK) >= RAM_MIRROR_END) ||
       (((addr & g_ram_mask) + length) > g_ram_size))
   {
-    const u8* ptr = static_cast<const u8*>(data);
-    const u8* const ptr_end = ptr + length;
+    const auto* ptr = static_cast<const u8*>(data);
+    const auto* const ptr_end = ptr + length;
     while (ptr != ptr_end)
     {
       if (!SafeWriteMemoryByte(addr++, *(ptr++)))
         return false;
     }
-
     return true;
   }
 
@@ -3289,12 +3412,22 @@ bool CPU::SafeWriteMemoryBytes(VirtualMemoryAddress addr, const void* data, u32 
   return true;
 }
 
-bool CPU::SafeWriteMemoryBytes(VirtualMemoryAddress addr, const std::span<const u8> data)
+
+/// \brief Safely writes a sequence of bytes to memory from a std::span.
+/// \param addr The virtual memory address to start writing to.
+/// \param data Span containing bytes to write.
+/// \return True if all bytes were written successfully, false otherwise.
+[[nodiscard]] bool CPU::SafeWriteMemoryBytes(const VirtualMemoryAddress addr, const std::span<const u8> data) noexcept
 {
   return SafeWriteMemoryBytes(addr, data.data(), static_cast<u32>(data.size()));
 }
 
-bool CPU::SafeZeroMemoryBytes(VirtualMemoryAddress addr, u32 length)
+
+/// \brief Safely zeroes a sequence of bytes in memory.
+/// \param addr The virtual memory address to start zeroing.
+/// \param length Number of bytes to zero.
+/// \return True if all bytes were zeroed successfully, false otherwise.
+[[nodiscard]] bool CPU::SafeZeroMemoryBytes(VirtualMemoryAddress addr, u32 length) noexcept
 {
   using namespace Bus;
 
@@ -3307,8 +3440,8 @@ bool CPU::SafeZeroMemoryBytes(VirtualMemoryAddress addr, u32 length)
       if (!CPU::SafeWriteMemoryByte(addr, 0)) [[unlikely]]
         return false;
 
-      addr++;
-      length--;
+      ++addr;
+      --length;
     }
     while (length >= 4)
     {
@@ -3323,8 +3456,8 @@ bool CPU::SafeZeroMemoryBytes(VirtualMemoryAddress addr, u32 length)
       if (!CPU::SafeWriteMemoryByte(addr, 0)) [[unlikely]]
         return false;
 
-      addr++;
-      length--;
+      ++addr;
+      --length;
     }
 
     return true;
@@ -3335,7 +3468,13 @@ bool CPU::SafeZeroMemoryBytes(VirtualMemoryAddress addr, u32 length)
   return true;
 }
 
-void* CPU::GetDirectReadMemoryPointer(VirtualMemoryAddress address, MemoryAccessSize size, TickCount* read_ticks)
+
+/// \brief Gets a direct pointer for reading memory, if possible (RAM, scratchpad, BIOS).
+/// \param address The virtual memory address to read from.
+/// \param size The access size (byte, halfword, word).
+/// \param read_ticks Optional pointer to store the read tick count.
+/// \return Pointer to the memory region, or nullptr if not directly accessible.
+[[nodiscard]] void* CPU::GetDirectReadMemoryPointer(const VirtualMemoryAddress address, const MemoryAccessSize size, TickCount* const read_ticks) noexcept
 {
   using namespace Bus;
 
@@ -3348,7 +3487,6 @@ void* CPU::GetDirectReadMemoryPointer(VirtualMemoryAddress address, MemoryAccess
   {
     if (read_ticks)
       *read_ticks = RAM_READ_TICKS;
-
     return &g_ram[paddr & g_ram_mask];
   }
 
@@ -3356,7 +3494,6 @@ void* CPU::GetDirectReadMemoryPointer(VirtualMemoryAddress address, MemoryAccess
   {
     if (read_ticks)
       *read_ticks = 0;
-
     return &g_state.scratchpad[paddr & SCRATCHPAD_OFFSET_MASK];
   }
 
@@ -3364,14 +3501,18 @@ void* CPU::GetDirectReadMemoryPointer(VirtualMemoryAddress address, MemoryAccess
   {
     if (read_ticks)
       *read_ticks = g_bios_access_time[static_cast<u32>(size)];
-
     return &g_bios[paddr & BIOS_MASK];
   }
 
   return nullptr;
 }
 
-void* CPU::GetDirectWriteMemoryPointer(VirtualMemoryAddress address, MemoryAccessSize size)
+
+/// \brief Gets a direct pointer for writing memory, if possible (RAM, scratchpad).
+/// \param address The virtual memory address to write to.
+/// \param size The access size (byte, halfword, word).
+/// \return Pointer to the memory region, or nullptr if not directly accessible.
+[[nodiscard]] void* CPU::GetDirectWriteMemoryPointer(const VirtualMemoryAddress address, const MemoryAccessSize size) noexcept
 {
   using namespace Bus;
 
@@ -3390,8 +3531,14 @@ void* CPU::GetDirectWriteMemoryPointer(VirtualMemoryAddress address, MemoryAcces
   return nullptr;
 }
 
+
+/// \brief Checks if a memory address is properly aligned for the given access size, raising exception if not.
+/// 	param type The memory access type (read or write).
+/// 	param size The memory access size (byte, halfword, word).
+/// \param address The virtual memory address to check.
+/// \return True if the address is aligned, false otherwise (raises exception).
 template<MemoryAccessType type, MemoryAccessSize size>
-ALWAYS_INLINE_RELEASE bool CPU::DoAlignmentCheck(VirtualMemoryAddress address)
+[[nodiscard]] ALWAYS_INLINE_RELEASE bool CPU::DoAlignmentCheck(const VirtualMemoryAddress address) noexcept
 {
   if constexpr (size == MemoryAccessSize::HalfWord)
   {
@@ -3416,8 +3563,9 @@ ALWAYS_INLINE_RELEASE bool CPU::DoAlignmentCheck(VirtualMemoryAddress address)
 #if 0
 static void MemoryBreakpoint(MemoryAccessType type, MemoryAccessSize size, VirtualMemoryAddress addr, u32 value)
 {
-  static constexpr const char* sizes[3] = { "byte", "halfword", "word" };
-  static constexpr const char* types[2] = { "read", "write" };
+  /// \brief Names for memory access sizes and types.
+  constinit static constexpr const char* sizes[3] = { "byte", "halfword", "word" };
+  constinit static constexpr const char* types[2] = { "read", "write" };
 
   const u32 cycle = TimingEvents::GetGlobalTickCounter() + CPU::g_state.pending_ticks;
   if (cycle == 3301006373)
